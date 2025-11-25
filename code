@@ -1,0 +1,245 @@
+import os
+import sys
+import math
+import time
+import argparse
+import ebooklib
+from ebooklib import epub
+
+from typing import List, Tuple, Optional
+
+# Text sources
+from ebooklib import epub
+from bs4 import BeautifulSoup
+from PyPDF2 import PdfReader
+
+# Translation and TTS
+from gtts import gTTS
+from googletrans import Translator
+
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def sanitize_filename(name: str) -> str:
+    return "".join(c for c in name if c.isalnum() or c in " _-").strip() or "audio"
+
+def read_txt(path: str) -> str:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+def read_pdf(path: str) -> str:
+    reader = PdfReader(path)
+    texts = []
+    for i, page in enumerate(reader.pages):
+        try:
+            texts.append(page.extract_text() or "")
+        except Exception:
+            texts.append("")
+    return "\n\n".join(texts)
+
+def read_epub(path: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """
+    Returns:
+      full_text: concatenated book text
+      sections: list of (title, text) per spine item for TOC-aware splitting
+    """
+    book = epub.read_epub(path)
+    sections = []
+    for item in book.get_items():
+        if item.get_type() == epub.ITEM_DOCUMENT:
+            # Extract readable text
+            soup = BeautifulSoup(item.get_content(), "html.parser")
+            # Remove scripts/styles
+            for tag in soup(["script", "style"]):
+                tag.decompose()
+            text = soup.get_text(separator="\n")
+            title = item.get_name()
+            sections.append((title, text))
+    full_text = "\n\n".join(t for _, t in sections)
+    return full_text, sections
+
+def detect_input_type(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".txt":
+        return "txt"
+    if ext == ".pdf":
+        return "pdf"
+    if ext == ".epub":
+        return "epub"
+    raise ValueError("Unsupported input type. Use .txt, .pdf, or .epub")
+
+def chunk_text_by_target_duration(text: str, wpm: int, minutes: int) -> List[str]:
+    """
+    Splits text into chunks aiming for target minutes per chunk using word count.
+    """
+    words = text.split()
+    words_per_chunk = max(1, int(wpm * minutes))
+    chunks = []
+    for i in range(0, len(words), words_per_chunk):
+        chunk_words = words[i : i + words_per_chunk]
+        chunks.append(" ".join(chunk_words))
+    return chunks
+
+def chunk_sections_by_target_duration(sections: List[Tuple[str, str]], wpm: int, minutes: int) -> List[Tuple[str, str]]:
+    """
+    Chunk each section so we can name files by section titles for EPUBs.
+    Returns list of (chunk_title, chunk_text).
+    """
+    output = []
+    target_words = max(1, int(wpm * minutes))
+    for title, text in sections:
+        words = text.split()
+        if not words:
+            continue
+        if len(words) <= target_words:
+            output.append((title, text))
+        else:
+            # Split long sections
+            num_chunks = math.ceil(len(words) / target_words)
+            for idx in range(num_chunks):
+                start = idx * target_words
+                end = start + target_words
+                chunk_words = words[start:end]
+                chunk_title = f"{title} (part {idx+1})"
+                output.append((chunk_title, " ".join(chunk_words)))
+    return output
+
+def translate_text(text: str, target_lang: str, translator: Optional[Translator] = None) -> str:
+    if not translator:
+        translator = Translator()
+    # Note: googletrans auto-detects source. For known English source, we can specify src="en".
+    # We’ll keep auto-detect to be robust.
+    # Large texts can time out; we split into manageable pieces.
+    max_chars = 4000  # conservative to avoid request issues
+    chunks = []
+    buf = []
+    char_count = 0
+    # Simple paragraph-based chunking
+    for para in text.split("\n"):
+        if char_count + len(para) + 1 > max_chars and buf:
+            chunk_text = "\n".join(buf)
+            chunks.append(chunk_text)
+            buf = [para]
+            char_count = len(para) + 1
+        else:
+            buf.append(para)
+            char_count += len(para) + 1
+    if buf:
+        chunks.append("\n".join(buf))
+    translated_parts = []
+    for c in chunks:
+        # Retry logic
+        for attempt in range(3):
+            try:
+                translated = translator.translate(c, dest=target_lang)
+                translated_parts.append(translated.text)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise e
+                time.sleep(1.0 + attempt)
+    return "\n".join(translated_parts)
+
+def synthesize_to_mp3(text: str, lang_code: str, out_path: str):
+    """
+    Use gTTS to synthesize text to MP3.
+    lang_code: 'en' for English, 'hi' for Hindi, etc.
+    """
+    tts = gTTS(text=text, lang=lang_code, slow=False)
+    tts.save(out_path)
+
+# ---------------------------
+# Main workflow
+# ---------------------------
+
+def process_input(input_path: str, output_dir: str, target_lang: str, chunk_minutes: int, wpm: int):
+    os.makedirs(output_dir, exist_ok=True)
+    base_name = sanitize_filename(os.path.splitext(os.path.basename(input_path))[0])
+
+    input_type = detect_input_type(input_path)
+
+    if input_type == "txt":
+        raw_text = read_txt(input_path)
+        sections = [("Document", raw_text)]
+    elif input_type == "pdf":
+        raw_text = read_pdf(input_path)
+        sections = [("Document", raw_text)]
+    elif input_type == "epub":
+        raw_text, epub_sections = read_epub(input_path)
+        # Prefer section-based chunking for better filenames
+        sections = epub_sections if epub_sections else [("Document", raw_text)]
+    else:
+        raise ValueError("Unsupported input type.")
+
+    # Clean up text a bit
+    cleaned_sections = []
+    for title, text in sections:
+        # Normalize whitespace
+        normalized = "\n".join(line.strip() for line in text.splitlines())
+        cleaned_sections.append((title, normalized))
+
+    # Chunking
+    if len(cleaned_sections) == 1 and cleaned_sections[0][0] == "Document":
+        # Single large body; chunk by duration
+        chunks = chunk_text_by_target_duration(cleaned_sections[0][1], wpm=wpm, minutes=chunk_minutes)
+        titled_chunks = [(f"{base_name} part {i+1}", c) for i, c in enumerate(chunks)]
+    else:
+        # Use section-aware chunking
+        titled_chunks = chunk_sections_by_target_duration(cleaned_sections, wpm=wpm, minutes=chunk_minutes)
+
+    # Translate if needed
+    lang_code_for_tts = target_lang.lower()
+    do_translate = lang_code_for_tts != "en"
+    translator = Translator() if do_translate else None
+
+    print(f"Preparing {len(titled_chunks)} audio chunks...")
+    for idx, (title, text) in enumerate(titled_chunks, start=1):
+        if not text.strip():
+            continue
+        working_text = text
+        if do_translate:
+            try:
+                working_text = translate_text(working_text, target_lang=lang_code_for_tts, translator=translator)
+            except Exception as e:
+                print(f"[WARN] Translation failed for chunk {idx} ({title}): {e}. Skipping translation for this chunk.")
+        # Synthesize
+        out_file = os.path.join(output_dir, f"{sanitize_filename(title)}.mp3")
+        try:
+            synthesize_to_mp3(working_text, lang_code=lang_code_for_tts, out_path=out_file)
+            print(f"[OK] Saved: {out_file}")
+        except Exception as e:
+            print(f"[ERROR] TTS failed for chunk {idx} ({title}): {e}")
+
+    print("Done.")
+
+# ---------------------------
+# CLI
+# ---------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Convert text/ebooks to audio with optional English→Hindi translation.")
+    parser.add_argument("--input", required=True, help="Path to .txt, .pdf, or .epub file")
+    parser.add_argument("--output", required=True, help="Directory to save MP3 files")
+    parser.add_argument("--lang", default="en", help="Target language for audio (e.g., en, hi). 'hi' translates to Hindi before TTS.")
+    parser.add_argument("--chunk-minutes", type=int, default=10, help="Approx minutes per audio chunk (default 10)")
+    parser.add_argument("--wpm", type=int, default=160, help="Estimated speech words per minute (default 160)")
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    try:
+        process_input(
+            input_path=args.input,
+            output_dir=args.output,
+            target_lang=args.lang,
+            chunk_minutes=args.chunk_minutes,
+            wpm=args.wpm,
+        )
+    except Exception as e:
+        print(f"[FATAL] {e}")
+        sys.exit(1)
+
+
+
+
